@@ -1,8 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
-import { fal } from "@fal-ai/client";
 
 export async function GET(req: NextRequest) {
-  const falKey = process.env.FAL_KEY;
+  const falKey = req.headers.get("x-fal-key") || process.env.FAL_KEY;
   const id = req.nextUrl.searchParams.get("id");
   const model = req.nextUrl.searchParams.get("model");
 
@@ -10,53 +9,67 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: "Invalid request" }, { status: 400 });
   }
 
-  fal.config({ credentials: falKey });
-
   try {
-    const statusRes = await fal.queue.status(model, {
-      requestId: id,
-      logs: false,
-    });
-
-    if (statusRes.status === "COMPLETED") {
-      // 直接从 response_url 获取结果
-      const response = await fetch(statusRes.response_url, {
+    // 直接调用 fal.ai REST API 获取状态
+    const statusResponse = await fetch(
+      `https://queue.fal.run/${model}/requests/${id}/status`,
+      {
         headers: {
-          Authorization: `Key ${falKey}`,
+          "Authorization": `Key ${falKey}`,
         },
-      });
-      const result = await response.json();
-      
-      // 检查是否有错误
+      }
+    );
+
+    const statusResult = await statusResponse.json() as {
+      status: string;
+      response_url?: string;
+    };
+
+    if (statusResult.status === "COMPLETED") {
+      // 获取结果
+      const resultResponse = await fetch(
+        `https://queue.fal.run/${model}/requests/${id}`,
+        {
+          headers: {
+            "Authorization": `Key ${falKey}`,
+          },
+        }
+      );
+
+      const result = await resultResponse.json() as Record<string, unknown>;
+
       if (result.detail) {
-        return NextResponse.json({ 
-          status: "failed", 
-          error: `处理失败: ${result.detail[0]?.msg || "未知错误"}` 
+        const errorMsg = Array.isArray(result.detail)
+          ? result.detail[0]?.msg
+          : result.detail;
+        return NextResponse.json({
+          status: "failed",
+          error: `处理失败: ${errorMsg}`,
         });
       }
-      
-      // 获取输出图片 URL
+
       let outputUrl = "";
-      if (result.image?.url) {
-        outputUrl = result.image.url;
-      } else if (result.images?.[0]?.url) {
-        outputUrl = result.images[0].url;
+      if ((result as { image?: { url: string } }).image?.url) {
+        outputUrl = (result as { image: { url: string } }).image.url;
+      } else if ((result as { images?: Array<{ url: string }> }).images?.[0]?.url) {
+        outputUrl = (result as { images: Array<{ url: string }> }).images[0].url;
       }
-      
+
       if (!outputUrl) {
-        return NextResponse.json({ 
-          status: "failed", 
-          error: "未找到输出图片" 
+        return NextResponse.json({
+          status: "failed",
+          error: "未找到输出图片",
         });
       }
-      
+
       return NextResponse.json({ status: "succeeded", output: outputUrl });
     }
 
-    // 检查是否失败
-    const isFailed = (statusRes.status as string) === "FAILED";
-    if (isFailed) {
-      return NextResponse.json({ status: "failed", error: "fal.ai 处理失败" });
+    if (statusResult.status === "FAILED") {
+      return NextResponse.json({
+        status: "failed",
+        error: "fal.ai 处理失败",
+      });
     }
 
     // IN_QUEUE or IN_PROGRESS
